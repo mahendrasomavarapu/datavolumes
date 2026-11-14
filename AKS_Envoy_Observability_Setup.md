@@ -1,34 +1,100 @@
-# Envoy Observability Stack for Kubemarine
+# Envoy Observability Stack
 
-The setup script installs a disposable Envoy test pair, a sample HTTP upstream,
-VictoriaMetrics Single, `vmagent`, and Grafana into a dedicated Kubernetes
-namespace. It provisions the included bandwidth dashboard and retains
-VictoriaMetrics data on a 5 GiB persistent volume.
+This guide documents the implementation in `setup_envoy_observability.sh`.
+The installer deploys a self-contained metrics demo into a dedicated Kubernetes
+namespace: two static-config Envoy proxies, a sample HTTP upstream,
+VictoriaMetrics Single, `vmagent`, and Grafana with the provisioned dashboard.
 
-## Prerequisites
+The script uses `kubectl` and Helm against the **current kubectl context**. It
+does not call Kubemarine itself. It was installed and verified on the local
+Minikube cluster; it can target a reachable Kubemarine-managed Kubernetes
+cluster whose version and storage meet the prerequisites below.
 
-- A reachable Kubernetes cluster in the current `kubectl` context
-- `kubectl`, Helm 3, and OpenSSL
-- A default StorageClass for VictoriaMetrics persistence
+## What is deployed
 
-The script pins the VictoriaMetrics and Grafana chart versions. Envoy,
-`vmagent`, and the sample upstream use pinned container image tags.
+| Component | Kubernetes resource / image | Purpose |
+|---|---|---|
+| Sample backend | `sample-backend` Deployment and Service; `hashicorp/http-echo:1.0.0` | Returns a fixed response so test requests generate traffic. |
+| External test Envoy | `envoy-external` Deployment and ClusterIP Service; `envoyproxy/envoy:v1.32.2` | Listens on HTTP port 10000 and routes requests to the sample backend. Exposes admin metrics on port 9901. |
+| Egress test Envoy | `envoy-egress` Deployment and ClusterIP Service; same Envoy image/config | A second independently scraped test proxy, labelled as the egress role. |
+| VictoriaMetrics | Helm release `victoria-metrics`, chart `vm/victoria-metrics-single` version `0.51.0` (app `v1.156.0`) | Stores metrics for seven days on a 5 GiB PVC. |
+| vmagent | `vmagent-envoy` Deployment and ClusterIP Service; `victoriametrics/vmagent:v1.156.0` | Scrapes both Envoy admin endpoints every 15 seconds and remote-writes metrics to VictoriaMetrics. |
+| Grafana | `grafana` Deployment and ClusterIP Service; `grafana/grafana:12.3.1` | Reads VictoriaMetrics and loads the dashboard and datasource from Kubernetes ConfigMaps. Grafana data is stored on a 2 GiB PVC. |
 
-## Install
+Each workload has one replica. The configured resources are:
+
+| Workload | CPU request | Memory request | Memory limit |
+|---|---:|---:|---:|
+| Sample backend | 25m | 32 MiB | 64 MiB |
+| Each Envoy | 50m | 64 MiB | 256 MiB |
+| vmagent | 50m | 64 MiB | 256 MiB |
+| VictoriaMetrics | 100m | 256 MiB | 768 MiB |
+| Grafana | 100m | 128 MiB | 512 MiB |
+
+No CPU limits are set by this demo.
+
+### Data flow
+
+1. A request to either Envoy Service on port `10000` is routed to
+   `sample-backend:5678`.
+2. `vmagent` scrapes
+   `envoy-external:9901/stats/prometheus` and
+   `envoy-egress:9901/stats/prometheus`.
+3. Scrape target labels distinguish the two sets of metrics:
+   `gateway_role="external"` or `gateway_role="egress"`, and
+   `cluster="kubemarine-test"`.
+4. vmagent remote-writes the metrics to VictoriaMetrics at
+   `http://victoria-metrics-victoria-metrics-single-server:8428/api/v1/write`.
+5. Grafana's provisioned VictoriaMetrics datasource queries that service.
+   The dashboard is mounted from the `envoy-transfer-dashboard` ConfigMap.
+
+The dashboard contains inbound and outbound throughput time series, four
+24-hour byte-volume stat panels, and a top-10 egress-cluster throughput panel.
+Its queries use Envoy downstream and upstream connection byte counters. It does
+not configure alert rules.
+
+## Prerequisites and cluster selection
+
+- `kubectl`, Helm 3, and `jq` installed locally. `openssl` is required when the
+  installer needs to generate a Grafana password.
+- A reachable Kubernetes cluster selected as the current context:
+
+  ```bash
+  kubectl config current-context
+  kubectl cluster-info
+  ```
+
+- Kubernetes 1.25 or newer for the pinned VictoriaMetrics chart.
+- A default StorageClass capable of provisioning ReadWriteOnce PVCs: 5 GiB
+  for VictoriaMetrics and 2 GiB for Grafana.
+- Access to pull the pinned container images and the VictoriaMetrics Helm
+  chart.
+
+Choose the target context before running the installer. It creates resources
+only in the requested namespace; it does not switch contexts or configure a
+Kubemarine cluster.
+
+## Install or update
+
+From the repository directory:
 
 ```bash
 chmod +x setup_envoy_observability.sh
 ./setup_envoy_observability.sh --namespace envoy-observability
 ```
 
-To render both Helm charts without installing resources:
+The namespace defaults to `envoy-observability`; it can also be selected with
+the `NAMESPACE` environment variable. Namespace names must be valid Kubernetes
+DNS labels.
 
-```bash
-./setup_envoy_observability.sh --namespace envoy-observability --dry-run
-```
+The installer adds/updates the VictoriaMetrics Helm repository, creates the
+namespace, creates or reuses the Grafana admin Secret, installs VictoriaMetrics,
+applies the Envoy/backend/vmagent/Grafana resources, and waits for each workload
+to become ready. Re-running the command applies the same configuration and
+upgrades the Helm release.
 
-To set a known Grafana admin password, provide it through the environment
-instead of placing it in the command line:
+To supply a known Grafana admin password without putting it in shell history or
+the process argument list:
 
 ```bash
 read -s GRAFANA_ADMIN_PASSWORD
@@ -37,42 +103,117 @@ export GRAFANA_ADMIN_PASSWORD
 unset GRAFANA_ADMIN_PASSWORD
 ```
 
-If no password is supplied and the Secret does not already exist, the script
-generates one. The password is stored in the `grafana-admin` Secret; retrieve it
-with:
+If `GRAFANA_ADMIN_PASSWORD` is not set and the namespace has no
+`grafana-admin` Secret, the installer generates a password using OpenSSL. If
+the Secret already exists and no password is supplied, the existing Secret is
+left unchanged. The Secret contains `admin-user` and `admin-password`.
+
+Retrieve the generated/current password on macOS:
 
 ```bash
 kubectl -n envoy-observability get secret grafana-admin \
-  -o jsonpath='{.data.admin-password}' | base64 -d
+  -o jsonpath='{.data.admin-password}' | base64 -D
 ```
 
-## Check the installation
+On GNU/Linux, use `base64 -d` instead of `base64 -D`.
 
-Each port-forward command must run in a separate terminal:
+### Render-only check
 
-| Component | Port-forward | URL |
+This validates the pinned VictoriaMetrics chart template and dashboard JSON;
+it does not contact the Kubernetes API or apply resources:
+
+```bash
+./setup_envoy_observability.sh --namespace envoy-observability --dry-run
+```
+
+## Access the services
+
+Start each port-forward in a **separate terminal** and leave it running while
+using its link. These commands are local-only access; Services are ClusterIP
+and are not exposed through a public LoadBalancer or Ingress.
+
+| Service | Port-forward command | Local URL |
 |---|---|---|
-| Grafana dashboard | `kubectl -n envoy-observability port-forward svc/grafana 3000:80` | <http://localhost:3000/d/aks-envoy-transfer-v1> |
-| VictoriaMetrics UI | `kubectl -n envoy-observability port-forward svc/victoria-metrics-victoria-metrics-single-server 8428:8428` | <http://localhost:8428/vmui/> |
-| Envoy sample upstream | `kubectl -n envoy-observability port-forward svc/envoy-external 8080:10000` | <http://localhost:8080/> |
-| Envoy Prometheus metrics | `kubectl -n envoy-observability port-forward svc/envoy-external 9901:9901` | <http://localhost:9901/stats/prometheus> |
-| vmagent scrape targets | `kubectl -n envoy-observability port-forward svc/vmagent-envoy 8429:8429` | <http://localhost:8429/targets> |
+| Grafana | `kubectl -n envoy-observability port-forward svc/grafana 3000:80` | [Dashboard](http://localhost:3000/d/aks-envoy-transfer-v1) |
+| VictoriaMetrics | `kubectl -n envoy-observability port-forward svc/victoria-metrics-victoria-metrics-single-server 8428:8428` | [VictoriaMetrics UI](http://localhost:8428/vmui/) |
+| External test proxy | `kubectl -n envoy-observability port-forward svc/envoy-external 8080:10000` | [Sample response](http://localhost:8080/) |
+| Egress test proxy | `kubectl -n envoy-observability port-forward svc/envoy-egress 8081:10000` | [Sample response](http://localhost:8081/) |
+| External Envoy metrics | `kubectl -n envoy-observability port-forward svc/envoy-external 9901:9901` | [Prometheus metrics](http://localhost:9901/stats/prometheus) |
+| vmagent targets | `kubectl -n envoy-observability port-forward svc/vmagent-envoy 8429:8429` | [Scrape target status](http://localhost:8429/targets) |
 
-Make requests to the sample upstream to populate the throughput panels. The
-dashboard collects both `external` and `egress` labels from the two Envoy test
-deployments.
+Log into Grafana with username `admin` and the password retrieved above. The
+dashboard UID is `aks-envoy-transfer-v1`; its displayed title is
+**Envoy Data Transfer & Bandwidth Observability**.
 
-## Notes
+## Generate and confirm sample traffic
 
-- The Envoy admin port is a ClusterIP service port, not exposed externally.
-- The test Envoys both route to the in-cluster sample HTTP upstream; replace
-  their configuration before using this as a production gateway.
-- This script no longer configures Graylog or forwards node logs. It installs
-  the metrics and dashboard stack requested for the test environment.
-- To inspect resources and logs:
+With the external proxy port-forward active, send requests to populate the
+dashboard:
+
+```bash
+for _ in $(seq 1 20); do
+  curl -fsS http://localhost:8080/ >/dev/null
+done
+```
+
+The egress proxy can be exercised similarly at `http://localhost:8081/`.
+Because the scrape interval is 15 seconds, allow at least one scrape interval
+for new metrics to appear.
+
+Check workload and storage status:
+
+```bash
+kubectl -n envoy-observability get pods,services,pvc
+kubectl -n envoy-observability get deployments,statefulsets
+```
+
+Check vmagent's active targets and logs:
+
+```bash
+kubectl -n envoy-observability port-forward svc/vmagent-envoy 8429:8429
+# In another terminal, open http://localhost:8429/targets
+kubectl -n envoy-observability logs deployment/vmagent-envoy
+```
+
+After forwarding VictoriaMetrics on local port 8428, query a stored Envoy
+counter:
+
+```bash
+curl -fsS \
+  'http://localhost:8428/api/v1/query?query=envoy_http_downstream_cx_rx_bytes_total' \
+  | jq .
+```
+
+The result should include samples with `gateway_role` set to `external` and
+`egress`.
+
+## Operations and limitations
+
+- Envoy admin metrics are available on an in-cluster ClusterIP Service on port
+  9901. They are not exposed publicly. Port-forward only to inspect them
+  locally.
+- Both demo Envoy Deployments use the same static configuration and route to
+  the sample backend. The “egress” proxy is a metrics demonstration, not a
+  production outbound firewall/proxy. The “external” proxy is not configured
+  with an external LoadBalancer, Ingress, TLS, or production access controls.
+- Before production use, replace the test routing and upstream, configure the
+  required gateway/network exposure, review Envoy admin access, resource
+  requests/limits, storage sizing, authentication, and network policies.
+- This implementation collects metrics only. It does not configure
+  Graylog/Rsyslog, node log shipping, Envoy JSON access logs, or Grafana alert
+  rules.
+- VictoriaMetrics retains seven days of data. Both VictoriaMetrics and Grafana
+  use PVCs, so persistent storage is required.
+- To inspect application logs:
 
   ```bash
-  kubectl -n envoy-observability get deployments,statefulsets,services,pvc
-  kubectl -n envoy-observability get pods
-  kubectl -n envoy-observability logs deploy/vmagent-envoy
+  kubectl -n envoy-observability logs deployment/envoy-external
+  kubectl -n envoy-observability logs deployment/envoy-egress
+  kubectl -n envoy-observability logs deployment/vmagent-envoy
+  kubectl -n envoy-observability logs deployment/grafana
   ```
+
+- Deleting the namespace removes the namespace's workloads, Secrets,
+  ConfigMaps, and PVCs. Depending on the StorageClass reclaim policy, deleting
+  PVCs can also delete the backing data. Check the PVCs and backups before
+  cleanup.

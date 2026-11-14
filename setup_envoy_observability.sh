@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-NAMESPACE="${AKS_NAMESPACE:-envoy-observability}"
+NAMESPACE="${NAMESPACE:-envoy-observability}"
 GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-}"
 DRY_RUN=false
 
 VM_CHART_VERSION="0.51.0"
-GRAFANA_CHART_VERSION="10.5.15"
+GRAFANA_IMAGE="grafana/grafana:12.3.1"
 ENVOY_IMAGE="envoyproxy/envoy:v1.32.2"
 BACKEND_IMAGE="hashicorp/http-echo:1.0.0"
 VMAGENT_IMAGE="victoriametrics/vmagent:v1.156.0"
@@ -58,9 +58,14 @@ done
 [[ "$NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] &&
   ((${#NAMESPACE} <= 63)) || fail "Invalid Kubernetes namespace: $NAMESPACE"
 
-for cmd in helm kubectl; do
+for cmd in helm kubectl jq; do
   command -v "$cmd" >/dev/null 2>&1 || fail "Required command '$cmd' was not found."
 done
+
+if [[ "$DRY_RUN" != true ]]; then
+  kubectl cluster-info >/dev/null 2>&1 ||
+    fail "Cannot reach the current Kubernetes context. Start/select the target cluster and retry."
+fi
 
 if [[ "$DRY_RUN" != true && -z "$GRAFANA_ADMIN_PASSWORD" ]] &&
   ! kubectl get secret grafana-admin \
@@ -73,8 +78,7 @@ TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 helm repo add vm https://victoriametrics.github.io/helm-charts/ --force-update >/dev/null
-helm repo add grafana https://grafana.github.io/helm-charts/ --force-update >/dev/null
-helm repo update
+helm repo update vm
 
 cat >"$TMP_DIR/vm-values.yaml" <<'EOF'
 server:
@@ -90,49 +94,17 @@ server:
       memory: 768Mi
 EOF
 
-cat >"$TMP_DIR/grafana-values.yaml" <<EOF
-admin:
-  existingSecret: grafana-admin
-service:
-  type: ClusterIP
-  port: 80
-sidecar:
-  dashboards:
-    enabled: true
-    label: grafana_dashboard
-    labelValue: "1"
-    searchNamespace: ${NAMESPACE}
-datasources:
-  datasources.yaml:
-    apiVersion: 1
-    datasources:
-      - name: VictoriaMetrics
-        type: prometheus
-        uid: victoriametrics-envoy
-        access: proxy
-        url: http://victoria-metrics-victoria-metrics-single-server:8428
-        isDefault: true
-        jsonData:
-          timeInterval: 15s
-resources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-EOF
-
 if [[ "$DRY_RUN" == true ]]; then
   helm template victoria-metrics vm/victoria-metrics-single \
     --version "$VM_CHART_VERSION" --namespace "$NAMESPACE" \
     -f "$TMP_DIR/vm-values.yaml" >/dev/null
-  helm template grafana grafana/grafana \
-    --version "$GRAFANA_CHART_VERSION" --namespace "$NAMESPACE" \
-    -f "$TMP_DIR/grafana-values.yaml" >/dev/null
-  printf 'Helm templates rendered successfully for namespace %s.\n' "$NAMESPACE"
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  [[ -f "$SCRIPT_DIR/envoy_transfer_dashboard.json" ]] ||
+    fail "Missing dashboard file: $SCRIPT_DIR/envoy_transfer_dashboard.json"
+  jq empty "$SCRIPT_DIR/envoy_transfer_dashboard.json"
+  printf 'VictoriaMetrics Helm chart and dashboard validated for namespace %s.\n' "$NAMESPACE"
   exit 0
 fi
-
-kubectl cluster-info >/dev/null 2>&1 ||
-  fail "Cannot reach the current Kubernetes context. Start/select the target cluster and retry."
 
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
@@ -473,23 +445,164 @@ spec:
 EOF
 
 printf '[4/5] Installing Grafana and provisioning the dashboard...\n'
-helm upgrade --install grafana grafana/grafana \
-  --version "$GRAFANA_CHART_VERSION" \
-  --namespace "$NAMESPACE" \
-  --values "$TMP_DIR/grafana-values.yaml" \
-  --wait --timeout 10m
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [[ -f "$SCRIPT_DIR/envoy_transfer_dashboard.json" ]] ||
   fail "Missing dashboard file: $SCRIPT_DIR/envoy_transfer_dashboard.json"
 sed 's/\${DS_VICTORIAMETRICS}/victoriametrics-envoy/g' \
   "$SCRIPT_DIR/envoy_transfer_dashboard.json" >"$TMP_DIR/dashboard.json"
+jq empty "$TMP_DIR/dashboard.json"
+
+cat >"$TMP_DIR/datasources.yaml" <<'EOF'
+apiVersion: 1
+datasources:
+  - name: VictoriaMetrics
+    type: prometheus
+    uid: victoriametrics-envoy
+    access: proxy
+    url: http://victoria-metrics-victoria-metrics-single-server:8428
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+EOF
+cat >"$TMP_DIR/dashboard-provider.yaml" <<'EOF'
+apiVersion: 1
+providers:
+  - name: Envoy
+    orgId: 1
+    folder: Envoy
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+kubectl create configmap grafana-provisioning \
+  --namespace "$NAMESPACE" \
+  --from-file=datasources.yaml="$TMP_DIR/datasources.yaml" \
+  --from-file=dashboard-provider.yaml="$TMP_DIR/dashboard-provider.yaml" \
+  --dry-run=client -o yaml | kubectl apply -f -
 kubectl create configmap envoy-transfer-dashboard \
   --namespace "$NAMESPACE" \
   --from-file=dashboard.json="$TMP_DIR/dashboard.json" \
   --dry-run=client -o yaml >"$TMP_DIR/dashboard-configmap.yaml"
 kubectl label --local -f "$TMP_DIR/dashboard-configmap.yaml" \
   grafana_dashboard=1 -o yaml | kubectl apply -f -
+
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: ${NAMESPACE}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: ${NAMESPACE}
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 472
+        runAsGroup: 472
+        fsGroup: 472
+      containers:
+        - name: grafana
+          image: ${GRAFANA_IMAGE}
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: admin-user
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: admin-password
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: grafana-data
+              mountPath: /var/lib/grafana
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+              readOnly: true
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: grafana-data
+          persistentVolumeClaim:
+            claimName: grafana-data
+        - name: datasources
+          configMap:
+            name: grafana-provisioning
+            items:
+              - key: datasources.yaml
+                path: datasources.yaml
+        - name: dashboard-provider
+          configMap:
+            name: grafana-provisioning
+            items:
+              - key: dashboard-provider.yaml
+                path: dashboard-provider.yaml
+        - name: dashboards
+          configMap:
+            name: envoy-transfer-dashboard
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+EOF
+
+if [[ -n "$GRAFANA_ADMIN_PASSWORD" ]]; then
+  kubectl rollout restart deployment/grafana --namespace "$NAMESPACE"
+fi
 
 printf '[5/5] Waiting for workloads...\n'
 kubectl rollout status deployment/sample-backend --namespace "$NAMESPACE" --timeout=5m
@@ -519,6 +632,10 @@ VictoriaMetrics:
 Envoy sample upstream:
   kubectl -n ${NAMESPACE} port-forward svc/envoy-external 8080:10000
   http://localhost:8080/
+
+Envoy egress test proxy:
+  kubectl -n ${NAMESPACE} port-forward svc/envoy-egress 8081:10000
+  http://localhost:8081/
 
 Envoy metrics:
   kubectl -n ${NAMESPACE} port-forward svc/envoy-external 9901:9901
