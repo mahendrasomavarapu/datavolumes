@@ -10,6 +10,7 @@ GRAFANA_IMAGE="grafana/grafana:12.3.1"
 ENVOY_IMAGE="envoyproxy/envoy:v1.32.2"
 BACKEND_IMAGE="hashicorp/http-echo:1.0.0"
 VMAGENT_IMAGE="victoriametrics/vmagent:v1.156.0"
+TRAFFIC_IMAGE="curlimages/curl:8.12.1"
 
 usage() {
   cat <<EOF
@@ -350,6 +351,41 @@ spec:
     - name: admin
       port: 9901
       targetPort: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy-demo-traffic
+  namespace: ${NAMESPACE}
+  labels:
+    app: envoy-demo-traffic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envoy-demo-traffic
+  template:
+    metadata:
+      labels:
+        app: envoy-demo-traffic
+    spec:
+      containers:
+        - name: curl
+          image: ${TRAFFIC_IMAGE}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              while true; do
+                curl --fail --silent --show-error http://envoy-external.${NAMESPACE}.svc.cluster.local:10000/ >/dev/null
+                curl --fail --silent --show-error http://envoy-egress.${NAMESPACE}.svc.cluster.local:10000/ >/dev/null
+                sleep 2
+              done
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
 EOF
 
 printf '[3/5] Installing vmagent...\n'
@@ -608,6 +644,7 @@ printf '[5/5] Waiting for workloads...\n'
 kubectl rollout status deployment/sample-backend --namespace "$NAMESPACE" --timeout=5m
 kubectl rollout status deployment/envoy-external --namespace "$NAMESPACE" --timeout=5m
 kubectl rollout status deployment/envoy-egress --namespace "$NAMESPACE" --timeout=5m
+kubectl rollout status deployment/envoy-demo-traffic --namespace "$NAMESPACE" --timeout=5m
 kubectl rollout status deployment/vmagent-envoy --namespace "$NAMESPACE" --timeout=5m
 kubectl rollout status statefulset/victoria-metrics-victoria-metrics-single-server \
   --namespace "$NAMESPACE" --timeout=10m
@@ -617,31 +654,19 @@ cat <<EOF
 
 Installation complete in namespace '${NAMESPACE}'.
 
-Run each port-forward command in its own terminal, then open the URL:
+All application endpoints remain cluster-internal; this installer does not
+start local port-forwards or expose public endpoints.
 
-Grafana:
-  kubectl -n ${NAMESPACE} port-forward svc/grafana 3000:80
-  http://localhost:3000/d/aks-envoy-transfer-v1
-  Username: admin
-  Password: kubectl -n ${NAMESPACE} get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d
+Grafana:        http://grafana.${NAMESPACE}.svc.cluster.local/
+Dashboard path: /d/aks-envoy-transfer-v1
+VictoriaMetrics: http://victoria-metrics-victoria-metrics-single-server.${NAMESPACE}.svc.cluster.local:8428/vmui/
+External Envoy: http://envoy-external.${NAMESPACE}.svc.cluster.local:10000/
+Egress Envoy:   http://envoy-egress.${NAMESPACE}.svc.cluster.local:10000/
 
-VictoriaMetrics:
-  kubectl -n ${NAMESPACE} port-forward svc/victoria-metrics-victoria-metrics-single-server 8428:8428
-  http://localhost:8428/vmui/
+These DNS names are reachable from workloads in the cluster. To open Grafana
+from outside Kubernetes, route it through your existing approved ingress or
+internal load balancer; do not expose the Envoy admin port.
 
-Envoy sample upstream:
-  kubectl -n ${NAMESPACE} port-forward svc/envoy-external 8080:10000
-  http://localhost:8080/
-
-Envoy egress test proxy:
-  kubectl -n ${NAMESPACE} port-forward svc/envoy-egress 8081:10000
-  http://localhost:8081/
-
-Envoy metrics:
-  kubectl -n ${NAMESPACE} port-forward svc/envoy-external 9901:9901
-  http://localhost:9901/stats/prometheus
-
-vmagent target status:
-  kubectl -n ${NAMESPACE} port-forward svc/vmagent-envoy 8429:8429
-  http://localhost:8429/targets
+Grafana username: admin
+Retrieve its password from the grafana-admin Secret in this namespace.
 EOF

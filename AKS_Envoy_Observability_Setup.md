@@ -2,13 +2,17 @@
 
 This guide documents the implementation in `setup_envoy_observability.sh`.
 The installer deploys a self-contained metrics demo into a dedicated Kubernetes
-namespace: two static-config Envoy proxies, a sample HTTP upstream,
-VictoriaMetrics Single, `vmagent`, and Grafana with the provisioned dashboard.
+namespace: two static-config Envoy proxies, a sample HTTP upstream, an
+in-cluster traffic generator, VictoriaMetrics Single, `vmagent`, and Grafana
+with the provisioned dashboard.
 
 The script uses `kubectl` and Helm against the **current kubectl context**. It
 does not call Kubemarine itself. It was installed and verified on the local
 Minikube cluster; it can target a reachable Kubemarine-managed Kubernetes
 cluster whose version and storage meet the prerequisites below.
+The deployment client is only used to submit Kubernetes resources; Envoy,
+traffic generation, metrics collection/storage, and Grafana run as Pods in the
+cluster. The installer does not run those application services on the client.
 
 ## What is deployed
 
@@ -17,6 +21,7 @@ cluster whose version and storage meet the prerequisites below.
 | Sample backend | `sample-backend` Deployment and Service; `hashicorp/http-echo:1.0.0` | Returns a fixed response so test requests generate traffic. |
 | External test Envoy | `envoy-external` Deployment and ClusterIP Service; `envoyproxy/envoy:v1.32.2` | Listens on HTTP port 10000 and routes requests to the sample backend. Exposes admin metrics on port 9901. |
 | Egress test Envoy | `envoy-egress` Deployment and ClusterIP Service; same Envoy image/config | A second independently scraped test proxy, labelled as the egress role. |
+| Demo traffic generator | `envoy-demo-traffic` Deployment; `curlimages/curl:8.12.1` | Sends requests to both Envoy Services every two seconds from inside Kubernetes so the dashboard has sample traffic without a local client. |
 | VictoriaMetrics | Helm release `victoria-metrics`, chart `vm/victoria-metrics-single` version `0.51.0` (app `v1.156.0`) | Stores metrics for seven days on a 5 GiB PVC. |
 | vmagent | `vmagent-envoy` Deployment and ClusterIP Service; `victoriametrics/vmagent:v1.156.0` | Scrapes both Envoy admin endpoints every 15 seconds and remote-writes metrics to VictoriaMetrics. |
 | Grafana | `grafana` Deployment and ClusterIP Service; `grafana/grafana:12.3.1` | Reads VictoriaMetrics and loads the dashboard and datasource from Kubernetes ConfigMaps. Grafana data is stored on a 2 GiB PVC. |
@@ -35,8 +40,8 @@ No CPU limits are set by this demo.
 
 ### Data flow
 
-1. A request to either Envoy Service on port `10000` is routed to
-   `sample-backend:5678`.
+1. `envoy-demo-traffic` sends requests to both Envoy Services on port `10000`.
+   Each Envoy routes requests to `sample-backend:5678`.
 2. `vmagent` scrapes
    `envoy-external:9901/stats/prometheus` and
    `envoy-egress:9901/stats/prometheus`.
@@ -128,37 +133,35 @@ it does not contact the Kubernetes API or apply resources:
 
 ## Access the services
 
-Start each port-forward in a **separate terminal** and leave it running while
-using its link. These commands are local-only access; Services are ClusterIP
-and are not exposed through a public LoadBalancer or Ingress.
+All Services are `ClusterIP`; the installer does not start local application
+processes or port-forwards, or create NodePorts or public endpoints. Use these
+service addresses from an existing in-cluster client:
 
-| Service | Port-forward command | Local URL |
-|---|---|---|
-| Grafana | `kubectl -n envoy-observability port-forward svc/grafana 3000:80` | [Dashboard](http://localhost:3000/d/aks-envoy-transfer-v1) |
-| VictoriaMetrics | `kubectl -n envoy-observability port-forward svc/victoria-metrics-victoria-metrics-single-server 8428:8428` | [VictoriaMetrics UI](http://localhost:8428/vmui/) |
-| External test proxy | `kubectl -n envoy-observability port-forward svc/envoy-external 8080:10000` | [Sample response](http://localhost:8080/) |
-| Egress test proxy | `kubectl -n envoy-observability port-forward svc/envoy-egress 8081:10000` | [Sample response](http://localhost:8081/) |
-| External Envoy metrics | `kubectl -n envoy-observability port-forward svc/envoy-external 9901:9901` | [Prometheus metrics](http://localhost:9901/stats/prometheus) |
-| vmagent targets | `kubectl -n envoy-observability port-forward svc/vmagent-envoy 8429:8429` | [Scrape target status](http://localhost:8429/targets) |
+| Service | In-cluster URL |
+|---|---|
+| Grafana | `http://grafana.envoy-observability.svc.cluster.local/` |
+| Dashboard | `http://grafana.envoy-observability.svc.cluster.local/d/aks-envoy-transfer-v1` |
+| VictoriaMetrics UI | `http://victoria-metrics-victoria-metrics-single-server.envoy-observability.svc.cluster.local:8428/vmui/` |
+| External test proxy | `http://envoy-external.envoy-observability.svc.cluster.local:10000/` |
+| Egress test proxy | `http://envoy-egress.envoy-observability.svc.cluster.local:10000/` |
+| External Envoy metrics | `http://envoy-external.envoy-observability.svc.cluster.local:9901/stats/prometheus` |
+| vmagent targets | `http://vmagent-envoy.envoy-observability.svc.cluster.local:8429/targets` |
 
+These are Kubernetes-internal DNS names, not links resolvable by a browser
+outside the cluster. To view Grafana externally, expose only the Grafana
+Service through your organization's existing internal Ingress or gateway, with
+its normal authentication and TLS policy. Do not expose the Envoy admin port.
 Log into Grafana with username `admin` and the password retrieved above. The
 dashboard UID is `aks-envoy-transfer-v1`; its displayed title is
 **Envoy Data Transfer & Bandwidth Observability**.
 
-## Generate and confirm sample traffic
+## Sample traffic
 
-With the external proxy port-forward active, send requests to populate the
-dashboard:
-
-```bash
-for _ in $(seq 1 20); do
-  curl -fsS http://localhost:8080/ >/dev/null
-done
-```
-
-The egress proxy can be exercised similarly at `http://localhost:8081/`.
-Because the scrape interval is 15 seconds, allow at least one scrape interval
-for new metrics to appear.
+The `envoy-demo-traffic` Deployment continuously calls both Envoy Services
+from inside the cluster. It starts with the installation and provides sample
+traffic for the dashboard; no local curl process or port-forward is needed.
+Because the scrape interval is 15 seconds, allow at least one interval for
+metrics to appear.
 
 Check workload and storage status:
 
@@ -167,21 +170,20 @@ kubectl -n envoy-observability get pods,services,pvc
 kubectl -n envoy-observability get deployments,statefulsets
 ```
 
-Check vmagent's active targets and logs:
+Check vmagent's active targets and logs from your Kubernetes administration
+environment or an existing in-cluster diagnostic client:
 
 ```bash
-kubectl -n envoy-observability port-forward svc/vmagent-envoy 8429:8429
-# In another terminal, open http://localhost:8429/targets
+kubectl -n envoy-observability get pods
 kubectl -n envoy-observability logs deployment/vmagent-envoy
 ```
 
-After forwarding VictoriaMetrics on local port 8428, query a stored Envoy
-counter:
+From an existing in-cluster diagnostic client, query a stored Envoy counter
+using the VictoriaMetrics service DNS:
 
 ```bash
 curl -fsS \
-  'http://localhost:8428/api/v1/query?query=envoy_http_downstream_cx_rx_bytes_total' \
-  | jq .
+  'http://victoria-metrics-victoria-metrics-single-server.envoy-observability.svc.cluster.local:8428/api/v1/query?query=envoy_http_downstream_cx_rx_bytes_total'
 ```
 
 The result should include samples with `gateway_role` set to `external` and
@@ -196,6 +198,8 @@ The result should include samples with `gateway_role` set to `external` and
   the sample backend. The “egress” proxy is a metrics demonstration, not a
   production outbound firewall/proxy. The “external” proxy is not configured
   with an external LoadBalancer, Ingress, TLS, or production access controls.
+- `envoy-demo-traffic` generates synthetic test requests continuously. Remove
+  or scale down this Deployment before using the namespace for real traffic.
 - Before production use, replace the test routing and upstream, configure the
   required gateway/network exposure, review Envoy admin access, resource
   requests/limits, storage sizing, authentication, and network policies.
