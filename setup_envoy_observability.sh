@@ -1,180 +1,417 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# ==============================================================================
-# AKS Envoy Data Transfer Observability Setup Script
-# Configures:
-#   1. vmagent on AKS scraping External Ingress & Outbound Egress Envoy URLs
-#   2. Remote-write to existing VictoriaMetrics (with optional Basic Auth)
-#   3. Rsyslog DaemonSet on AKS forwarding Envoy JSON logs to Graylog
-#   4. Grafana VictoriaMetrics Datasource + Bandwidth Dashboard via Grafana API
-# ==============================================================================
+NAMESPACE="${AKS_NAMESPACE:-envoy-observability}"
+GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-}"
+DRY_RUN=false
 
-NAMESPACE="${AKS_NAMESPACE:-observability}"
-ENVOY_EXTERNAL_URLS="${ENVOY_EXTERNAL_URLS:-}"
-ENVOY_EGRESS_URLS="${ENVOY_EGRESS_URLS:-}"
-VM_WRITE_URL="${VM_WRITE_URL:-}"
-VM_QUERY_URL="${VM_QUERY_URL:-}"
-VM_USER="${VM_USER:-}"
-VM_PASS="${VM_PASS:-}"
-GRAFANA_URL="${GRAFANA_URL:-}"
-GRAFANA_USER="${GRAFANA_USER:-}"
-GRAFANA_PASS="${GRAFANA_PASS:-}"
-GRAYLOG_HOST="${GRAYLOG_HOST:-}"
-GRAYLOG_PORT="${GRAYLOG_PORT:-1514}"
+VM_CHART_VERSION="0.51.0"
+GRAFANA_CHART_VERSION="10.5.15"
+ENVOY_IMAGE="envoyproxy/envoy:v1.32.2"
+BACKEND_IMAGE="hashicorp/http-echo:1.0.0"
+VMAGENT_IMAGE="victoriametrics/vmagent:v1.156.0"
 
-print_usage() {
+usage() {
   cat <<EOF
-Usage: $0 [OPTIONS]
+Usage: $0 [--namespace NAME] [--dry-run]
+
+Installs a test Envoy ingress/egress pair, a sample HTTP upstream,
+VictoriaMetrics Single, vmagent, and Grafana with the Envoy dashboard.
 
 Options:
-  --envoy-external-urls   Comma-separated External Envoy Prometheus URLs (e.g., http://10.0.1.5:19001/stats/prometheus)
-  --envoy-egress-urls     Comma-separated Egress Envoy Prometheus URLs (e.g., http://10.0.2.8:19001/stats/prometheus)
-  --vm-write-url          VictoriaMetrics remote-write URL (e.g., http://vm:8428/api/v1/write)
-  --vm-query-url          VictoriaMetrics query URL for Grafana (e.g., http://vm:8428)
-  --vm-user               VictoriaMetrics Basic Auth username (optional)
-  --vm-pass               VictoriaMetrics Basic Auth password (optional)
-  --grafana-url           Grafana base URL (e.g., https://grafana.corp.internal)
-  --grafana-user          Grafana Admin username
-  --grafana-pass          Grafana Admin password
-  --graylog-host          Graylog Syslog/GELF TCP host
-  --graylog-port          Graylog Syslog/GELF TCP port (default: 1514)
-  --namespace             AKS namespace to deploy collectors into (default: observability)
-  -h, --help              Show this help message
+  --namespace NAME  Kubernetes namespace (default: envoy-observability)
+  --dry-run         Render and validate Helm charts without changing the cluster
+  -h, --help        Show this help
+
+Optional environment:
+  GRAFANA_ADMIN_PASSWORD  Set the Grafana admin password; otherwise retrieve it
+                          from the grafana-admin Kubernetes Secret after install.
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
+fail() {
+  printf '[ERROR] %s\n' "$*" >&2
+  exit 1
+}
+
+while (($#)); do
   case "$1" in
-    --envoy-external-urls) ENVOY_EXTERNAL_URLS="$2"; shift 2 ;;
-    --envoy-egress-urls)   ENVOY_EGRESS_URLS="$2"; shift 2 ;;
-    --vm-write-url)        VM_WRITE_URL="$2"; shift 2 ;;
-    --vm-query-url)        VM_QUERY_URL="$2"; shift 2 ;;
-    --vm-user)             VM_USER="$2"; shift 2 ;;
-    --vm-pass)             VM_PASS="$2"; shift 2 ;;
-    --grafana-url)         GRAFANA_URL="$2"; shift 2 ;;
-    --grafana-user)        GRAFANA_USER="$2"; shift 2 ;;
-    --grafana-pass)        GRAFANA_PASS="$2"; shift 2 ;;
-    --graylog-host)        GRAYLOG_HOST="$2"; shift 2 ;;
-    --graylog-port)        GRAYLOG_PORT="$2"; shift 2 ;;
-    --namespace)           NAMESPACE="$2"; shift 2 ;;
-    -h|--help)             print_usage; exit 0 ;;
-    *)                     echo "Unknown option: $1"; print_usage; exit 1 ;;
+    --namespace)
+      (($# >= 2)) || fail "--namespace requires a value"
+      NAMESPACE="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      fail "Unknown option: $1"
+      ;;
   esac
 done
 
-# Interactive fallback for missing required values
-prompt_if_empty() {
-  local var_name="$1"
-  local prompt_text="$2"
-  local is_secret="${3:-false}"
-  if [[ -z "${!var_name}" ]]; then
-    if [[ "$is_secret" == "true" ]]; then
-      read -rsp "$prompt_text: " input_val
-      echo ""
-    else
-      read -rp "$prompt_text: " input_val
-    fi
-    eval "$var_name=\"\$input_val\""
-  fi
-}
+[[ "$NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] &&
+  ((${#NAMESPACE} <= 63)) || fail "Invalid Kubernetes namespace: $NAMESPACE"
 
-echo "=== AKS Envoy Data Transfer Observability Installer ==="
-prompt_if_empty ENVOY_EXTERNAL_URLS "Enter External Envoy Prometheus URL(s) (comma-separated)"
-prompt_if_empty ENVOY_EGRESS_URLS   "Enter Outbound Egress Envoy Prometheus URL(s) (comma-separated)"
-prompt_if_empty VM_WRITE_URL        "Enter VictoriaMetrics Remote-Write URL (e.g. http://vm:8428/api/v1/write)"
-prompt_if_empty VM_QUERY_URL        "Enter VictoriaMetrics Query URL (e.g. http://vm:8428)"
-read -rp "Enter VictoriaMetrics Username (press Enter if none) [${VM_USER}]: " vm_u_in
-VM_USER="${vm_u_in:-$VM_USER}"
-if [[ -n "$VM_USER" && -z "$VM_PASS" ]]; then
-  read -rsp "Enter VictoriaMetrics Password: " VM_PASS
-  echo ""
-fi
-prompt_if_empty GRAFANA_URL         "Enter Grafana URL (e.g. https://grafana.internal)"
-prompt_if_empty GRAFANA_USER        "Enter Grafana Admin Username"
-prompt_if_empty GRAFANA_PASS        "Enter Grafana Admin Password" "true"
-prompt_if_empty GRAYLOG_HOST        "Enter Graylog Syslog TCP Host (e.g. graylog.logging)"
-
-# Validate prerequisites
-for cmd in kubectl curl jq; do
-  if ! command -v "$cmd" &>/dev/null; then
-    echo "[ERROR] Required CLI tool '$cmd' is not installed or not in PATH."
-    exit 1
-  fi
+for cmd in helm kubectl; do
+  command -v "$cmd" >/dev/null 2>&1 || fail "Required command '$cmd' was not found."
 done
 
-# Helper to parse URLs into scheme, host:port, and metrics_path
-parse_envoy_targets() {
-  local csv_urls="$1"
-  local job_name="$2"
-  local gateway_role="$3"
-  local first_url
-  first_url=$(echo "$csv_urls" | cut -d',' -f1 | xargs)
-
-  local scheme="http"
-  [[ "$first_url" == https://* ]] && scheme="https"
-
-  local path
-  path=$(echo "$first_url" | sed -E 's|^https?://[^/]+||')
-  [[ -z "$path" ]] && path="/stats/prometheus"
-
-  echo "  - job_name: '${job_name}'"
-  echo "    scheme: '${scheme}'"
-  echo "    metrics_path: '${path}'"
-  echo "    scrape_interval: 15s"
-  echo "    static_configs:"
-  echo "      - targets:"
-  IFS=',' read -ra URL_ARR <<< "$csv_urls"
-  for u in "${URL_ARR[@]}"; do
-    u_trimmed=$(echo "$u" | xargs)
-    hostport=$(echo "$u_trimmed" | sed -E 's|^https?://||' | cut -d'/' -f1)
-    echo "          - '${hostport}'"
-  done
-  echo "        labels:"
-  echo "          gateway_role: '${gateway_role}'"
-  echo "          cluster: 'aks-production'"
-  echo "    metric_relabel_configs:"
-  echo "      - source_labels: [__name__]"
-  echo "        regex: '(envoy_http_downstream_cx_.*_bytes_total|envoy_cluster_upstream_cx_.*_bytes_total|envoy_http_downstream_rq_total|envoy_cluster_upstream_rq_total|envoy_server_live)'"
-  echo "        action: keep"
-}
-
-echo "[1/4] Creating namespace '${NAMESPACE}' and VictoriaMetrics credentials..."
-kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
-
-VM_AUTH_ARGS=""
-if [[ -n "$VM_USER" ]]; then
-  kubectl -n "${NAMESPACE}" create secret generic vm-remote-write-auth \
-    --from-literal=username="${VM_USER}" \
-    --from-literal=password="${VM_PASS}" \
-    --dry-run=client -o yaml | kubectl apply -f -
-  VM_AUTH_ARGS='
-            - -remoteWrite.basicAuth.username=$(VM_USER)
-            - -remoteWrite.basicAuth.password=$(VM_PASS)'
+if [[ "$DRY_RUN" != true && -z "$GRAFANA_ADMIN_PASSWORD" ]] &&
+  ! kubectl get secret grafana-admin \
+  --namespace "$NAMESPACE" >/dev/null 2>&1; then
+  command -v openssl >/dev/null 2>&1 || fail "openssl is required to generate a Grafana password."
+  GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 24 | tr -d '\n')"
 fi
 
-echo "[2/4] Generating vmagent ConfigMap and Deployment for Envoy scraping..."
-TMP_DIR=$(mktemp -d)
+TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-cat <<EOF > "${TMP_DIR}/vmagent-scrape.yml"
-global:
-  scrape_interval: 15s
+helm repo add vm https://victoriametrics.github.io/helm-charts/ --force-update >/dev/null
+helm repo add grafana https://grafana.github.io/helm-charts/ --force-update >/dev/null
+helm repo update
 
-scrape_configs:
-$(parse_envoy_targets "$ENVOY_EXTERNAL_URLS" "envoy-external-gateway" "external")
-$(parse_envoy_targets "$ENVOY_EGRESS_URLS" "envoy-egress-proxy" "egress")
+cat >"$TMP_DIR/vm-values.yaml" <<'EOF'
+server:
+  retentionPeriod: 7d
+  persistentVolume:
+    enabled: true
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 768Mi
 EOF
 
-kubectl -n "${NAMESPACE}" create configmap vmagent-envoy-config \
-  --from-file=scrape.yml="${TMP_DIR}/vmagent-scrape.yml" \
-  --dry-run=client -o yaml | kubectl apply -f -
+cat >"$TMP_DIR/grafana-values.yaml" <<EOF
+admin:
+  existingSecret: grafana-admin
+service:
+  type: ClusterIP
+  port: 80
+sidecar:
+  dashboards:
+    enabled: true
+    label: grafana_dashboard
+    labelValue: "1"
+    searchNamespace: ${NAMESPACE}
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: VictoriaMetrics
+        type: prometheus
+        uid: victoriametrics-envoy
+        access: proxy
+        url: http://victoria-metrics-victoria-metrics-single-server:8428
+        isDefault: true
+        jsonData:
+          timeInterval: 15s
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+EOF
 
-cat <<EOF | kubectl -n "${NAMESPACE}" apply -f -
+if [[ "$DRY_RUN" == true ]]; then
+  helm template victoria-metrics vm/victoria-metrics-single \
+    --version "$VM_CHART_VERSION" --namespace "$NAMESPACE" \
+    -f "$TMP_DIR/vm-values.yaml" >/dev/null
+  helm template grafana grafana/grafana \
+    --version "$GRAFANA_CHART_VERSION" --namespace "$NAMESPACE" \
+    -f "$TMP_DIR/grafana-values.yaml" >/dev/null
+  printf 'Helm templates rendered successfully for namespace %s.\n' "$NAMESPACE"
+  exit 0
+fi
+
+kubectl cluster-info >/dev/null 2>&1 ||
+  fail "Cannot reach the current Kubernetes context. Start/select the target cluster and retry."
+
+kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+if [[ -n "$GRAFANA_ADMIN_PASSWORD" ]]; then
+  umask 077
+  printf 'admin-user=admin\nadmin-password=%s\n' "$GRAFANA_ADMIN_PASSWORD" >"$TMP_DIR/grafana-admin.env"
+  kubectl create secret generic grafana-admin \
+    --namespace "$NAMESPACE" \
+    --from-env-file="$TMP_DIR/grafana-admin.env" \
+    --dry-run=client -o yaml | kubectl apply -f -
+fi
+
+printf '[1/5] Installing VictoriaMetrics Single...\n'
+helm upgrade --install victoria-metrics vm/victoria-metrics-single \
+  --version "$VM_CHART_VERSION" \
+  --namespace "$NAMESPACE" \
+  --values "$TMP_DIR/vm-values.yaml" \
+  --wait --timeout 10m
+
+printf '[2/5] Creating the sample upstream and Envoy configuration...\n'
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-config
+  namespace: ${NAMESPACE}
+data:
+  envoy.yaml: |
+    admin:
+      access_log_path: /dev/null
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 9901
+    static_resources:
+      listeners:
+        - name: listener_http
+          address:
+            socket_address:
+              address: 0.0.0.0
+              port_value: 10000
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    route_config:
+                      name: local_route
+                      virtual_hosts:
+                        - name: sample_backend
+                          domains: ["*"]
+                          routes:
+                            - match:
+                                prefix: /
+                              route:
+                                cluster: sample_backend
+                    http_filters:
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+        - name: sample_backend
+          connect_timeout: 2s
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: sample_backend
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address:
+                          address: sample-backend.${NAMESPACE}.svc.cluster.local
+                          port_value: 5678
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-backend
+  namespace: ${NAMESPACE}
+  labels:
+    app: sample-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sample-backend
+  template:
+    metadata:
+      labels:
+        app: sample-backend
+    spec:
+      containers:
+        - name: http-echo
+          image: ${BACKEND_IMAGE}
+          args: ["-listen=:5678", "-text=Hello from the Envoy sample upstream"]
+          ports:
+            - name: http
+              containerPort: 5678
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-backend
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: sample-backend
+  ports:
+    - name: http
+      port: 5678
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy-external
+  namespace: ${NAMESPACE}
+  labels:
+    app: envoy-external
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envoy-external
+  template:
+    metadata:
+      labels:
+        app: envoy-external
+    spec:
+      containers:
+        - name: envoy
+          image: ${ENVOY_IMAGE}
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          ports:
+            - name: http
+              containerPort: 10000
+            - name: admin
+              containerPort: 9901
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/envoy
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: envoy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-external
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: envoy-external
+  ports:
+    - name: http
+      port: 10000
+      targetPort: http
+    - name: admin
+      port: 9901
+      targetPort: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy-egress
+  namespace: ${NAMESPACE}
+  labels:
+    app: envoy-egress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envoy-egress
+  template:
+    metadata:
+      labels:
+        app: envoy-egress
+    spec:
+      containers:
+        - name: envoy
+          image: ${ENVOY_IMAGE}
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          ports:
+            - name: http
+              containerPort: 10000
+            - name: admin
+              containerPort: 9901
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: admin
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/envoy
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: envoy-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-egress
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: envoy-egress
+  ports:
+    - name: http
+      port: 10000
+      targetPort: http
+    - name: admin
+      port: 9901
+      targetPort: admin
+EOF
+
+printf '[3/5] Installing vmagent...\n'
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vmagent-envoy-config
+  namespace: ${NAMESPACE}
+data:
+  scrape.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: envoy-external
+        metrics_path: /stats/prometheus
+        static_configs:
+          - targets: ["envoy-external.${NAMESPACE}.svc.cluster.local:9901"]
+            labels:
+              gateway_role: external
+              cluster: kubemarine-test
+      - job_name: envoy-egress
+        metrics_path: /stats/prometheus
+        static_configs:
+          - targets: ["envoy-egress.${NAMESPACE}.svc.cluster.local:9901"]
+            labels:
+              gateway_role: egress
+              cluster: kubemarine-test
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vmagent-envoy
+  namespace: ${NAMESPACE}
   labels:
     app: vmagent-envoy
 spec:
@@ -189,184 +426,105 @@ spec:
     spec:
       containers:
         - name: vmagent
-          image: victoriametrics/vmagent:v1.106.1
+          image: ${VMAGENT_IMAGE}
           args:
             - -promscrape.config=/etc/vmagent/scrape.yml
-            - -remoteWrite.url=${VM_WRITE_URL}
-            - -remoteWrite.tmpDataPath=/tmp/vmagent-remotewrite-data${VM_AUTH_ARGS}
-          env:
-            - name: VM_USER
-              valueFrom:
-                secretKeyRef:
-                  name: vm-remote-write-auth
-                  key: username
-                  optional: true
-            - name: VM_PASS
-              valueFrom:
-                secretKeyRef:
-                  name: vm-remote-write-auth
-                  key: password
-                  optional: true
+            - -remoteWrite.url=http://victoria-metrics-victoria-metrics-single-server:8428/api/v1/write
+            - -remoteWrite.tmpDataPath=/tmp/vmagent-remotewrite-data
           ports:
-            - containerPort: 8429
-              name: http
+            - name: http
+              containerPort: 8429
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
           volumeMounts:
             - name: config
               mountPath: /etc/vmagent
+              readOnly: true
+            - name: data
+              mountPath: /tmp/vmagent-remotewrite-data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
       volumes:
         - name: config
           configMap:
             name: vmagent-envoy-config
-EOF
-
-echo "[3/4] Deploying Rsyslog DaemonSet on AKS to ship Envoy access logs to Graylog (${GRAYLOG_HOST}:${GRAYLOG_PORT})..."
-cat <<EOF | kubectl -n "${NAMESPACE}" apply -f -
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: rsyslog-envoy-config
-data:
-  rsyslog.conf: |
-    module(load="imfile" PollingInterval="2")
-
-    global(workDirectory="/var/spool/rsyslog")
-
-    template(name="EnvoyGraylogTemplate" type="string"
-      string="<%pri%>1 %timestamp:::date-rfc3339% %hostname% envoy-aks - - - %msg%\n"
-    )
-
-    input(type="imfile"
-      File="/var/log/containers/*envoy*.log"
-      Tag="envoy-access"
-      Severity="info"
-      Facility="local6"
-      reopenOnTruncate="on"
-    )
-
-    if \$syslogtag == 'envoy-access' then {
-      action(
-        type="omfwd"
-        target="${GRAYLOG_HOST}"
-        port="${GRAYLOG_PORT}"
-        protocol="tcp"
-        template="EnvoyGraylogTemplate"
-        queue.type="LinkedList"
-        queue.filename="envoy_fwd_queue"
-        queue.maxdiskspace="1g"
-        queue.saveonshutdown="on"
-        action.resumeRetryCount="-1"
-      )
-      stop
-    }
+        - name: data
+          emptyDir: {}
 ---
-apiVersion: apps/v1
-kind: DaemonSet
+apiVersion: v1
+kind: Service
 metadata:
-  name: rsyslog-envoy-forwarder
-  labels:
-    app: rsyslog-envoy-forwarder
+  name: vmagent-envoy
+  namespace: ${NAMESPACE}
 spec:
   selector:
-    matchLabels:
-      app: rsyslog-envoy-forwarder
-  template:
-    metadata:
-      labels:
-        app: rsyslog-envoy-forwarder
-    spec:
-      containers:
-        - name: rsyslog
-          image: rsyslog/syslog_appliance_alpine:latest
-          volumeMounts:
-            - name: rsyslog-conf
-              mountPath: /etc/rsyslog.conf
-              subPath: rsyslog.conf
-            - name: varlogcontainers
-              mountPath: /var/log/containers
-              readOnly: true
-            - name: varlogpods
-              mountPath: /var/log/pods
-              readOnly: true
-            - name: spool
-              mountPath: /var/spool/rsyslog
-      volumes:
-        - name: rsyslog-conf
-          configMap:
-            name: rsyslog-envoy-config
-        - name: varlogcontainers
-          hostPath:
-            path: /var/log/containers
-        - name: varlogpods
-          hostPath:
-            path: /var/log/pods
-        - name: spool
-          emptyDir: {}
+    app: vmagent-envoy
+  ports:
+    - name: http
+      port: 8429
+      targetPort: http
 EOF
 
-echo "[4/4] Configuring VictoriaMetrics Datasource and Bandwidth Dashboard in Grafana (${GRAFANA_URL})..."
-GRAFANA_CLEAN_URL="${GRAFANA_URL%/}"
+printf '[4/5] Installing Grafana and provisioning the dashboard...\n'
+helm upgrade --install grafana grafana/grafana \
+  --version "$GRAFANA_CHART_VERSION" \
+  --namespace "$NAMESPACE" \
+  --values "$TMP_DIR/grafana-values.yaml" \
+  --wait --timeout 10m
 
-# Create or update VictoriaMetrics Datasource
-DS_PAYLOAD=$(jq -n \
-  --arg url "$VM_QUERY_URL" \
-  --arg user "$VM_USER" \
-  --arg pass "$VM_PASS" \
-  '{
-    name: "VictoriaMetrics-Envoy",
-    type: "prometheus",
-    uid: "victoriametrics-envoy",
-    url: $url,
-    access: "proxy",
-    basicAuth: ($user != ""),
-    basicAuthUser: $user,
-    secureJsonData: (if $pass != "" then {basicAuthPassword: $pass} else {} end),
-    jsonData: {httpMethod: "POST", timeInterval: "15s"}
-  }')
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$SCRIPT_DIR/envoy_transfer_dashboard.json" ]] ||
+  fail "Missing dashboard file: $SCRIPT_DIR/envoy_transfer_dashboard.json"
+sed 's/\${DS_VICTORIAMETRICS}/victoriametrics-envoy/g' \
+  "$SCRIPT_DIR/envoy_transfer_dashboard.json" >"$TMP_DIR/dashboard.json"
+kubectl create configmap envoy-transfer-dashboard \
+  --namespace "$NAMESPACE" \
+  --from-file=dashboard.json="$TMP_DIR/dashboard.json" \
+  --dry-run=client -o yaml >"$TMP_DIR/dashboard-configmap.yaml"
+kubectl label --local -f "$TMP_DIR/dashboard-configmap.yaml" \
+  grafana_dashboard=1 -o yaml | kubectl apply -f -
 
-HTTP_CODE=$(curl -s -o "${TMP_DIR}/ds_resp.json" -w "%{http_code}" \
-  -u "${GRAFANA_USER}:${GRAFANA_PASS}" \
-  -H "Content-Type: application/json" \
-  -X POST "${GRAFANA_CLEAN_URL}/api/datasources" \
-  -d "${DS_PAYLOAD}")
+printf '[5/5] Waiting for workloads...\n'
+kubectl rollout status deployment/sample-backend --namespace "$NAMESPACE" --timeout=5m
+kubectl rollout status deployment/envoy-external --namespace "$NAMESPACE" --timeout=5m
+kubectl rollout status deployment/envoy-egress --namespace "$NAMESPACE" --timeout=5m
+kubectl rollout status deployment/vmagent-envoy --namespace "$NAMESPACE" --timeout=5m
+kubectl rollout status statefulset/victoria-metrics-victoria-metrics-single-server \
+  --namespace "$NAMESPACE" --timeout=10m
+kubectl rollout status deployment/grafana --namespace "$NAMESPACE" --timeout=10m
 
-if [[ "$HTTP_CODE" == "409" ]]; then
-  echo "  -> Datasource 'VictoriaMetrics-Envoy' already exists, updating..."
-  curl -s -o /dev/null -u "${GRAFANA_USER}:${GRAFANA_PASS}" \
-    -H "Content-Type: application/json" \
-    -X PUT "${GRAFANA_CLEAN_URL}/api/datasources/uid/victoriametrics-envoy" \
-    -d "${DS_PAYLOAD}"
-elif [[ "$HTTP_CODE" != "200" ]]; then
-  echo "  -> [WARN] Grafana Datasource API returned HTTP ${HTTP_CODE}: $(cat "${TMP_DIR}/ds_resp.json")"
-else
-  echo "  -> Datasource 'VictoriaMetrics-Envoy' created successfully."
-fi
+cat <<EOF
 
-# Import Grafana Dashboard
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "${SCRIPT_DIR}/envoy_transfer_dashboard.json" ]]; then
-  DASH_RAW=$(sed 's/\${DS_VICTORIAMETRICS}/victoriametrics-envoy/g' "${SCRIPT_DIR}/envoy_transfer_dashboard.json")
-else
-  echo "[ERROR] envoy_transfer_dashboard.json not found in ${SCRIPT_DIR}."
-  exit 1
-fi
+Installation complete in namespace '${NAMESPACE}'.
 
-IMPORT_PAYLOAD=$(jq -n --argjson dash "$DASH_RAW" '{dashboard: $dash, overwrite: true, folderId: 0}')
+Run each port-forward command in its own terminal, then open the URL:
 
-DASH_CODE=$(curl -s -o "${TMP_DIR}/dash_resp.json" -w "%{http_code}" \
-  -u "${GRAFANA_USER}:${GRAFANA_PASS}" \
-  -H "Content-Type: application/json" \
-  -X POST "${GRAFANA_CLEAN_URL}/api/dashboards/db" \
-  -d "${IMPORT_PAYLOAD}")
+Grafana:
+  kubectl -n ${NAMESPACE} port-forward svc/grafana 3000:80
+  http://localhost:3000/d/aks-envoy-transfer-v1
+  Username: admin
+  Password: kubectl -n ${NAMESPACE} get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d
 
-if [[ "$DASH_CODE" == "200" ]]; then
-  DASH_URL=$(jq -r '.url' "${TMP_DIR}/dash_resp.json")
-  echo "  -> Dashboard imported successfully: ${GRAFANA_CLEAN_URL}${DASH_URL}"
-else
-  echo "  -> [WARN] Grafana Dashboard API returned HTTP ${DASH_CODE}: $(cat "${TMP_DIR}/dash_resp.json")"
-fi
+VictoriaMetrics:
+  kubectl -n ${NAMESPACE} port-forward svc/victoria-metrics-victoria-metrics-single-server 8428:8428
+  http://localhost:8428/vmui/
 
-echo ""
-echo "=== Setup Complete! ==="
-echo "1. vmagent deployed in namespace '${NAMESPACE}' scraping External & Egress Envoy targets."
-echo "2. Rsyslog DaemonSet deployed in namespace '${NAMESPACE}' forwarding to ${GRAYLOG_HOST}:${GRAYLOG_PORT}."
-echo "3. Grafana dashboard available at: ${GRAFANA_CLEAN_URL}/d/aks-envoy-transfer-v1"
+Envoy sample upstream:
+  kubectl -n ${NAMESPACE} port-forward svc/envoy-external 8080:10000
+  http://localhost:8080/
+
+Envoy metrics:
+  kubectl -n ${NAMESPACE} port-forward svc/envoy-external 9901:9901
+  http://localhost:9901/stats/prometheus
+
+vmagent target status:
+  kubectl -n ${NAMESPACE} port-forward svc/vmagent-envoy 8429:8429
+  http://localhost:8429/targets
+EOF

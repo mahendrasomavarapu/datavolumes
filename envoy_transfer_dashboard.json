@@ -312,7 +312,7 @@
   "schemaVersion": 38,
   "style": "dark",
   "tags": [
-    "aks",
+    "kubemarine",
     "envoy",
     "victoriametrics",
     "bandwidth",
@@ -339,7 +339,7 @@
     "from": "now-6h",
     "to": "now"
   },
-  "title": "AKS Envoy Data Transfer & Bandwidth Observability",
+  "title": "Envoy Data Transfer & Bandwidth Observability",
   "uid": "aks-envoy-transfer-v1",
   "version": 1
 }

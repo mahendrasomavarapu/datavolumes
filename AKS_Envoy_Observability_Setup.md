@@ -1,116 +1,78 @@
-# AKS Envoy Data Transfer Observability — Implementation Guide
+# Envoy Observability Stack for Kubemarine
 
-This guide provides an automated setup to capture, store, visualize, and audit inbound (External Gateway) and outbound (Egress Proxy) data transfer rates across your existing **AKS, VictoriaMetrics, Grafana, Graylog, and Rsyslog** stack.
+The setup script installs a disposable Envoy test pair, a sample HTTP upstream,
+VictoriaMetrics Single, `vmagent`, and Grafana into a dedicated Kubernetes
+namespace. It provisions the included bandwidth dashboard and retains
+VictoriaMetrics data on a 5 GiB persistent volume.
 
----
+## Prerequisites
 
-## 1. Prerequisites & Required Parameters
+- A reachable Kubernetes cluster in the current `kubectl` context
+- `kubectl`, Helm 3, and OpenSSL
+- A default StorageClass for VictoriaMetrics persistence
 
-Before running the deployment script, gather the following environment endpoints and credentials:
+The script pins the VictoriaMetrics and Grafana chart versions. Envoy,
+`vmagent`, and the sample upstream use pinned container image tags.
 
-| Parameter | Description | Example |
-| :--- | :--- | :--- |
-| `ENVOY_EXTERNAL_URLS` | Comma-separated Prometheus admin endpoints for External Ingress Envoy | `http://envoy-ext-1.ingress:19001/stats/prometheus,http://envoy-ext-2.ingress:19001/stats/prometheus` |
-| `ENVOY_EGRESS_URLS` | Comma-separated Prometheus admin endpoints for Outbound Egress Envoy | `http://envoy-egress-1.egress:19001/stats/prometheus` |
-| `VM_WRITE_URL` | VictoriaMetrics remote-write endpoint (`vmagent` target) | `http://victoriametrics.monitoring:8428/api/v1/write` |
-| `VM_QUERY_URL` | VictoriaMetrics Prometheus-compatible datasource URL for Grafana | `http://victoriametrics.monitoring:8428` |
-| `VM_USER` / `VM_PASS` | Basic auth credentials for VictoriaMetrics (leave blank if unauthenticated) | `admin` / `********` |
-| `GRAFANA_URL` | Base URL of your existing Grafana instance | `https://grafana.internal.corp` |
-| `GRAFANA_USER` / `GRAFANA_PASS` | Grafana Admin username & password (or Service Account token) | `admin` / `********` |
-| `GRAYLOG_HOST` / `GRAYLOG_PORT` | Graylog Syslog/GELF TCP input host and port for Rsyslog forwarding | `graylog.logging.svc.cluster.local` / `1514` |
-| `AKS_NAMESPACE` | Kubernetes namespace where `vmagent` and Rsyslog DaemonSet will be deployed | `observability` |
+## Install
 
----
-
-## 2. Quick Start: Automated Setup Script
-
-Save and execute the accompanying **`setup_envoy_observability.sh`** script. You can pass parameters via CLI flags or environment variables.
-
-### Option A: Run via Command-Line Flags
 ```bash
 chmod +x setup_envoy_observability.sh
-
-./setup_envoy_observability.sh \
-  --envoy-external-urls "http://10.240.1.15:19001/stats/prometheus,http://10.240.1.16:19001/stats/prometheus" \
-  --envoy-egress-urls "http://10.240.2.20:19001/stats/prometheus" \
-  --vm-write-url "http://victoriametrics.monitoring:8428/api/v1/write" \
-  --vm-query-url "http://victoriametrics.monitoring:8428" \
-  --vm-user "vmadmin" \
-  --vm-pass "SuperSecretVM" \
-  --grafana-url "https://grafana.example.com" \
-  --grafana-user "admin" \
-  --grafana-pass "SuperSecretGrafana" \
-  --graylog-host "graylog.logging" \
-  --graylog-port "1514" \
-  --namespace "observability"
+./setup_envoy_observability.sh --namespace envoy-observability
 ```
 
-### Option B: Interactive Prompt Mode
-Simply run `./setup_envoy_observability.sh` with no arguments, and the script will interactively prompt you for each URL and password securely (masking passwords).
+To render both Helm charts without installing resources:
 
----
-
-## 3. What the Script Automates
-
-1. **Kubernetes Secret & ConfigMap Generation (`vmagent`)**
-   * Creates a Kubernetes `Secret` storing VictoriaMetrics basic auth credentials (if provided).
-   * Generates a `vmagent` scrape configuration (`scrape.yml`) with two distinct jobs (`envoy-external-gateway` and `envoy-egress-proxy`) injecting `gateway_role="external"` and `gateway_role="egress"` labels.
-   * Applies metric relabeling rules to drop high-cardinality unused Envoy histograms while preserving exact byte counters (`envoy_http_downstream_cx_*_bytes_total`, `envoy_cluster_upstream_cx_*_bytes_total`).
-   * Deploys `vmagent` into your AKS cluster pointing to your existing VictoriaMetrics instance.
-
-2. **Rsyslog DaemonSet Deployment (AKS Node Log Shipping to Graylog)**
-   * Deploys an `rsyslog` ConfigMap and DaemonSet configured with `imfile` to tail `/var/log/containers/*envoy*.log`.
-   * Configures disk-assisted LinkedList memory queues (`queue.type="LinkedList"`) to prevent log loss or node I/O spikes during heavy traffic bursts.
-   * Forwards structured JSON logs directly to your Graylog TCP Syslog/GELF endpoint.
-
-3. **Grafana Datasource & Dashboard Provisioning via API**
-   * Registers (or updates) the **VictoriaMetrics** datasource in Grafana via `/api/datasources`.
-   * Imports the complete **AKS Envoy Data Transfer & Bandwidth Observability** dashboard (`envoy_transfer_dashboard.json`) via `/api/dashboards/db`, pre-configured with:
-     * **Inbound External Throughput (Mbps / Bytes/sec)**
-     * **Outbound Egress Throughput (Mbps / Bytes/sec)**
-     * **Cumulative 24h / 7d Data Volume (GB / TB)**
-     * **Top Upstream Clusters & Services Driving Egress**
-     * **Automated Threshold Alert Panel**
-
----
-
-## 4. Required Envoy Proxy Configuration Snippet
-
-Ensure your External and Egress Envoy proxies expose the admin stats endpoint and emit JSON access logs with byte counters. Add this snippet to your Envoy `HttpConnectionManager` config:
-
-```yaml
-access_log:
-  - name: envoy.access_loggers.file
-    typed_config:
-      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
-      path: /dev/stdout
-      json_format:
-        timestamp: "%START_TIME%"
-        gateway_role: "%ENVIRONMENT(GATEWAY_ROLE)%"
-        authority: "%REQ(:AUTHORITY)%"
-        method: "%REQ(:METHOD)%"
-        path: "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%"
-        response_code: "%RESPONSE_CODE%"
-        bytes_received: "%BYTES_RECEIVED%"
-        bytes_sent: "%BYTES_SENT%"
-        duration_ms: "%DURATION%"
-        upstream_cluster: "%UPSTREAM_CLUSTER%"
-        upstream_host: "%UPSTREAM_HOST%"
-        downstream_remote_addr: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%"
+```bash
+./setup_envoy_observability.sh --namespace envoy-observability --dry-run
 ```
 
----
+To set a known Grafana admin password, provide it through the environment
+instead of placing it in the command line:
 
-## 5. Verification & Post-Setup Checks
+```bash
+read -s GRAFANA_ADMIN_PASSWORD
+export GRAFANA_ADMIN_PASSWORD
+./setup_envoy_observability.sh --namespace envoy-observability
+unset GRAFANA_ADMIN_PASSWORD
+```
 
-1. **Check `vmagent` Targets:**
-   ```bash
-   kubectl -n observability port-forward deploy/vmagent-envoy 8429:8429
-   # Open http://localhost:8429/targets to verify both external & egress Envoy targets are UP
-   ```
-2. **Verify Rsyslog Forwarding:**
-   ```bash
-   kubectl -n observability logs -l app=rsyslog-envoy-forwarder --tail=50
-   ```
-3. **Open Grafana Dashboard:**
-   Log into your `GRAFANA_URL` and navigate to **Dashboards -> AKS Envoy Data Transfer & Bandwidth Observability**.
+If no password is supplied and the Secret does not already exist, the script
+generates one. The password is stored in the `grafana-admin` Secret; retrieve it
+with:
+
+```bash
+kubectl -n envoy-observability get secret grafana-admin \
+  -o jsonpath='{.data.admin-password}' | base64 -d
+```
+
+## Check the installation
+
+Each port-forward command must run in a separate terminal:
+
+| Component | Port-forward | URL |
+|---|---|---|
+| Grafana dashboard | `kubectl -n envoy-observability port-forward svc/grafana 3000:80` | <http://localhost:3000/d/aks-envoy-transfer-v1> |
+| VictoriaMetrics UI | `kubectl -n envoy-observability port-forward svc/victoria-metrics-victoria-metrics-single-server 8428:8428` | <http://localhost:8428/vmui/> |
+| Envoy sample upstream | `kubectl -n envoy-observability port-forward svc/envoy-external 8080:10000` | <http://localhost:8080/> |
+| Envoy Prometheus metrics | `kubectl -n envoy-observability port-forward svc/envoy-external 9901:9901` | <http://localhost:9901/stats/prometheus> |
+| vmagent scrape targets | `kubectl -n envoy-observability port-forward svc/vmagent-envoy 8429:8429` | <http://localhost:8429/targets> |
+
+Make requests to the sample upstream to populate the throughput panels. The
+dashboard collects both `external` and `egress` labels from the two Envoy test
+deployments.
+
+## Notes
+
+- The Envoy admin port is a ClusterIP service port, not exposed externally.
+- The test Envoys both route to the in-cluster sample HTTP upstream; replace
+  their configuration before using this as a production gateway.
+- This script no longer configures Graylog or forwards node logs. It installs
+  the metrics and dashboard stack requested for the test environment.
+- To inspect resources and logs:
+
+  ```bash
+  kubectl -n envoy-observability get deployments,statefulsets,services,pvc
+  kubectl -n envoy-observability get pods
+  kubectl -n envoy-observability logs deploy/vmagent-envoy
+  ```
