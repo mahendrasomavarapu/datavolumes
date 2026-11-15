@@ -1,0 +1,203 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: global-guard-rules
+  namespace: envoy-observability
+  labels:
+    env: global
+data:
+  rate-limit.yaml: |
+    # Global rate limit configuration applied to all envoy proxies
+    # This configmap is referenced by the envoy-config ConfigMap
+    rate_limit:
+      category:
+        key: envoy.filters.http.router.requested_server_name
+      stage: 0
+      timeout: 0s
+      domain: global
+      requests_per_unit: 1000
+      unit: second
+    # IP-based rate limiting for external access
+    ip_rate_limit:
+      category:
+        key: source.ip
+      stage: 0
+      timeout: 0s
+      domain: ip_limit
+      requests_per_unit: 100
+      unit: second
+    # Per-domain rate limiting
+    domain_rate_limit:
+      domain: "envoy-observability.svc.cluster.local"
+      stage: 0
+      timeout: 0s
+      domain: global
+      requests_per_unit: 500
+      unit: second
+  csp.yaml: |
+    # Content Security Policy headers applied globally
+    content_security_policy:
+      default_src: "self"
+      script_src: "self"
+      style_src: "self"
+      img_src: "self"
+      connect_src: "self"
+      frame_ancestors: "none"
+  security-headers.yaml: |
+    # Global security headers for all HTTP responses
+    server_header: "Envoy-Observability"
+    x_content_type_options: "nosniff"
+    x_frame_options: "SAMEORIGIN"
+    x_xss_protection: "1; mode=block"
+    strict_transport_security: "max-age=31536000; includeSubDomains"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-global-filters
+  namespace: envoy-observability
+  labels:
+    env: global
+data:
+  global-filter.yaml: |
+    # Global Envoy filter for rate limiting and security
+    # This filter is inserted into all envoy proxies via the proxy-filter
+    # Apply to all HTTP connection managers
+    - name: envoy.filters.http.rate_limit
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.rate_limit.v3.RateLimit
+        domain: global
+        stage: 0
+        timeout: 0s
+        requests_per_unit: 1000
+        unit: second
+        filter:
+          http_filters:
+            - name: envoy.filters.http.router
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+    - name: envoy.filters.http.cors
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+        allow_origin_string_match:
+          - prefix: "*"
+        allow_methods: "GET, PUT, POST, DELETE"
+        allow_headers: "keep-alive, x-requested-with, content-type"
+        expose_headers: "x-request-id"
+        max_age: "3600"
+    - name: envoy.filters.http.authenticationjwt
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.http.jwt_authn.v3alpha.JwtAuthentication
+        providers:
+          jwt:
+            issuer: "accounts.example.com"
+            jwks_uri: "https://accounts.example.com/.well-known/jwks.json"
+            downstream_https_disabled: false
+            id_token_signing_key_values: []
+            audiences: []
+    # Global access log configuration
+    access_log:
+      path: "/dev/null"
+      format:
+        "@type": "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"
+        filename: "/tmp/envoy_access.log"
+        log_format:
+          "%REQ(:METHOD)% %REQ(:PATH)% %REQ(:SIZE)% %REQ(X-REQUEST-ID)% %REQ(USER-AGENT)% %REQ(X-FORWARDED-FOR)% %STARTED-%D %D%\"%"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-policy-global
+  namespace: envoy-observability
+  labels:
+    env: global
+data:
+  global-np.yaml: |
+    # Global NetworkPolicy that applies across namespaces
+    # Allows only necessary traffic for observability stack
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: global-observability-allow
+      namespace: envoy-observability
+    spec:
+      podSelector: {}
+      policyTypes:
+        - Ingress
+        - Egress
+      ingress:
+        - from:
+            - podSelector:
+                matchLabels:
+                  app: vmagent-envoy
+            - podSelector:
+                matchLabels:
+                  app: grafana
+            - podSelector:
+                matchLabels:
+                  app: victoria-metrics
+      egress:
+        - to:
+            - podSelector:
+                matchLabels:
+                  app: kube-dns
+            - namespaceSelector:
+                matchLabels:
+                  name: kube-system
+    # Allow traffic to external monitoring only
+    - name: global-observability-egress
+      namespace: envoy-observability
+      spec:
+        podSelector: {}
+        policyTypes:
+          - Egress
+        egress:
+          - to:
+              - podSelector: {}
+              - namespaceSelector:
+                  matchLabels:
+                    name: kube-system
+          - to:
+              - namespaceSelector:
+                  matchLabels:
+                    name: envoy-observability
+              - podSelector:
+                  matchLabels:
+                    app: vmagent-envoy
+          - ports:
+              - port: 5678
+                protocol: TCP
+              - port: 8428
+                protocol: TCP
+              - port: 9901
+                protocol: TCP
+              - port: 10000
+                protocol: TCP
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: global-guard-policy
+  namespace: kube-system
+spec:
+  # Global admission control for guard rules
+  # This policy validates that all deployments have appropriate guard rules applied
+  patchSettings:
+    patchTypes:
+      - DEFAULT
+    patchMatch:
+      labelSelector:
+        matchExpressions:
+          - key: guard.rules
+            operator: In
+            values: ["enabled"]
+  matchConstraints:
+    - expression: "request.object.metadata.labels.has('guard-rules')"
+      operator: "Exists"
+  validations:
+    - message: "Global guard rules must be applied to all workloads"
+      deny: {}
+    - message: "Rate limiting configuration must be present"
+      deny: {}
+    - message: "Security headers must be configured"
+      deny: {}
